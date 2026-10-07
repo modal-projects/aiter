@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -954,7 +955,10 @@ def mla_gluon(
         # partition from the runtime KV length. Head blocks and MTP qlen already
         # consume part of the wave, so the budget divides by them too.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+        # AITER_MLA_GLUON_WG_BUDGET raises the budget for long-context MTP
+        # verify, where 256 WGs leave each split streaming ~10k tokens serially.
+        wg_budget = int(os.environ.get("AITER_MLA_GLUON_WG_BUDGET", "256"))
+        NUM_KV_SPLITS = max(1, wg_budget // (batch_size * qlen * NUM_M_BLOCKS))
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
