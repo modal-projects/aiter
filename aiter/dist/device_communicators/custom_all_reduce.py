@@ -1412,6 +1412,28 @@ class CustomAllreduce:
             )
         return out
 
+    def all_gather_lastdim_add(
+        self,
+        inp: torch.Tensor,
+        add_b: torch.Tensor,
+        add_c: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """out = bf16(bf16(allgather(inp, dim=-1) + add_b) [+ add_c]) in one
+        launch (the add3 double rounding). Under graph capture inp is read
+        in place (capture registers it); otherwise it is staged into the
+        registered input pool first."""
+        rows = inp.shape[0]
+        if out is None:
+            out = torch.empty(
+                (rows, inp.shape[-1] * self.world_size), dtype=inp.dtype, device=inp.device
+            )
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.all_gather_lastdim_add(self._ptr, inp, out, add_b, add_c, reg, reg_bytes)
+        return out
+
     def all_gather_unreg(
         self, inp: torch.Tensor, out: torch.Tensor = None, dim: int = 0
     ):
