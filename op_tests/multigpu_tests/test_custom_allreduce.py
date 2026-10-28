@@ -97,37 +97,72 @@ def _run_all_gather_lastdim_add_case(
     rankID, tp_size, case_idx, shape, dtype, withGraph, graphs
 ):
     """Run ``all_gather_lastdim_add`` on one ``[rows, n]`` shard per rank and
-    check it bit-exactly against ``cat(shards, -1) + add_b + add_c``.
+    check it bit-exactly against ``cat(shards, -1) + add_b [+ add_c]``, with
+    and without ``add_c``.
 
     The kernel rounds to ``dtype`` after each add, like the unfused sequence,
     so the comparison uses ``atol=rtol=0``. Graph mode keeps the captured
-    graph alive in ``graphs`` for the same reason as the all-reduce sweep.
+    graph alive in ``graphs`` for the same reason as the all-reduce sweep, and
+    rewrites the input shard in place before a last replay to check that the
+    graph reads the shard's current contents.
     """
     rows, n = shape
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
-    shards = [
-        torch.randn((rows, n), dtype=dtype, device="cuda", generator=gen)
-        for _ in range(tp_size)
-    ]
+
+    def make_shards():
+        return [
+            torch.randn((rows, n), dtype=dtype, device="cuda", generator=gen)
+            for _ in range(tp_size)
+        ]
+
+    shards = make_shards()
     full = (rows, n * tp_size)
     add_b = torch.randn(full, dtype=dtype, device="cuda", generator=gen)
     add_c = torch.randn(full, dtype=dtype, device="cuda", generator=gen)
-    ref = torch.cat(shards, dim=-1) + add_b + add_c
     x = shards[rankID]
     ca = get_tp_group().device_communicator.ca_comm
+    msg = f"test_all_gather_lastdim_add: rank={rankID} {shape=} {dtype=} {withGraph=}"
+
+    def check(out, out_b, shards, tag):
+        gathered = torch.cat(shards, dim=-1)
+        err = checkAllclose(
+            gathered + add_b + add_c, out, rtol=0, atol=0, msg=f"{msg} {tag}"
+        )
+        err_b = checkAllclose(
+            gathered + add_b, out_b, rtol=0, atol=0, msg=f"{msg} {tag} add_c=None"
+        )
+        return max(err, err_b)
 
     if withGraph:
-        graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
-            out = ca.all_gather_lastdim_add(x, add_b, add_c)
-        out.fill_(0)
-        graphs.append((graph, x, add_b, add_c, out))
+
+        def capture(*adds):
+            graph = torch.cuda.CUDAGraph()
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                out = ca.all_gather_lastdim_add(x, *adds)
+            out.fill_(0)
+            graphs.append((graph, x, *adds, out))
+            return graph, out
+
+        graph, out = capture(add_b, add_c)
+        graph_b, out_b = capture(add_b)
 
         @perftest()
         def run_ca():
             graph.replay()
 
         _, us = run_ca()
+        graph_b.replay()
+        torch.cuda.synchronize()
+        err = check(out, out_b, shards, "replay")
+
+        # Peers read x in place, so every rank must be done replaying first.
+        dist.barrier()
+        shards = make_shards()
+        x.copy_(shards[rankID])
+        graph.replay()
+        graph_b.replay()
+        torch.cuda.synchronize()
+        err = max(err, check(out, out_b, shards, "replay after input update"))
     else:
 
         @perftest()
@@ -135,12 +170,11 @@ def _run_all_gather_lastdim_add_case(
             return ca.all_gather_lastdim_add(x, add_b, add_c)
 
         out, us = run_ca(x)
+        out_b = ca.all_gather_lastdim_add(x, add_b)
+        err = check(out, out_b, shards, "eager")
 
-    msg = (
-        f"test_all_gather_lastdim_add: rank={rankID} {shape=} {dtype=} "
-        f"{withGraph=} {us:>8.2f}"
-    )
-    return {"us": us, "err": checkAllclose(ref, out, rtol=0, atol=0, msg=msg)}
+    print(f"{msg} {us:>8.2f}")
+    return {"us": us, "err": err}
 
 
 def allreduce_custom_sweep(
